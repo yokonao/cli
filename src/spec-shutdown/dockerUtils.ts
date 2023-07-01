@@ -187,6 +187,15 @@ export async function listVolumes(params: DockerCLIParameters | PartialExecParam
 		.filter(s => !!s);
 }
 
+export async function stopContainers(params: DockerCLIParameters | PartialExecParameters | DockerResolverParameters, ids: string[]) { 
+	if (!ids.length) {
+		return;
+	}
+
+	const result = await dockerCLI(params, 'stop', ...ids);
+	return result.stdout.toString();
+}
+
 export async function createVolume(params: DockerCLIParameters | PartialExecParameters | DockerResolverParameters, name: string, labels: string[]) {
 	const labelArgs: string[] = [];
 	for (const label of labels) {

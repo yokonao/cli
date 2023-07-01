@@ -15,11 +15,11 @@ import { ContainerError } from '../spec-common/errors';
 import { Log, LogDimensions, LogLevel, makeLog, mapLogLevel } from '../spec-utils/log';
 import { probeRemoteEnv, runLifecycleHooks, runRemoteCommand, UserEnvProbe, setupInContainer } from '../spec-common/injectHeadless';
 import { extendImage } from './containerFeatures';
-import { DockerCLIParameters, dockerPtyCLI, inspectContainer } from '../spec-shutdown/dockerUtils';
+import { DockerCLIParameters, dockerPtyCLI, inspectContainer, stopContainers } from '../spec-shutdown/dockerUtils';
 import { buildAndExtendDockerCompose, dockerComposeCLIConfig, getDefaultImageName, getProjectName, readDockerComposeConfig, readVersionPrefix } from './dockerCompose';
 import { DevContainerConfig, DevContainerFromDockerComposeConfig, DevContainerFromDockerfileConfig, getDockerComposeFilePaths } from '../spec-configuration/configuration';
 import { workspaceFromPath } from '../spec-utils/workspaces';
-import { readDevContainerConfigFile } from './configContainer';
+import { readDevContainerConfigFile, stopDevcontainer } from './configContainer';
 import { getDefaultDevContainerConfigPath, getDevContainerConfigPathIn, uriToFsPath } from '../spec-configuration/configurationCommonUtils';
 import { CLIHost, getCLIHost } from '../spec-common/cliHost';
 import { loadNativeModule, processSignals } from '../spec-common/commonUtils';
@@ -62,6 +62,7 @@ const mountRegex = /^type=(bind|volume),source=([^,]+),target=([^,]+)(?:,externa
 	y.wrap(Math.min(120, y.terminalWidth()));
 	y.command('up', 'Create and run dev container', provisionOptions, provisionHandler);
 	y.command('set-up', 'Set up an existing container as a dev container', setUpOptions, setUpHandler);
+	y.command('stop', 'Stop dev container', stopOptions, stopHandler);
 	y.command('build [path]', 'Build a dev container image', buildOptions, buildHandler);
 	y.command('run-user-commands', 'Run user commands', runUserCommandsOptions, runUserCommandsHandler);
 	y.command('read-configuration', 'Read configuration', readConfigurationOptions, readConfigurationHandler);
@@ -1265,5 +1266,126 @@ async function readSecretsFromFile(params: { output?: Log; secretsFile?: string;
 			description: 'Failed to read/parse secrets',
 			originalError: e
 		});
+	}
+}
+
+function stopOptions(y: Argv) {
+	return y.options({
+		'docker-path': { type: 'string', description: 'Docker CLI path.' },
+		'docker-compose-path': { type: 'string', description: 'Docker Compose CLI path.' },
+		'id-label': { type: 'string', description: 'Id label(s) of the format name=value. If no --id-label is given, one will be inferred from the --workspace-folder path.' },
+		'workspace-folder': { type: 'string', description: 'Workspace folder path. The devcontainer.json will be looked up relative to this path.' },
+		'config': { type: 'string', description: 'devcontainer.json path. The default is to use .devcontainer/devcontainer.json or, if that does not exist, .devcontainer.json in the workspace folder.' },
+		'override-config': { type: 'string', description: 'devcontainer.json path to override any devcontainer.json in the workspace folder (or built-in configuration). This is required when there is no devcontainer.json otherwise.' },
+		'log-level': { choices: ['info' as 'info', 'debug' as 'debug', 'trace' as 'trace'], default: 'info' as 'info', description: 'Log level for the --terminal-log-file. When set to trace, the log level for --log-file will also be set to trace.' },
+		'log-format': { choices: ['text' as 'text', 'json' as 'json'], default: 'text' as 'text', description: 'Log format.' },
+		'terminal-columns': { type: 'number', implies: ['terminal-rows'], description: 'Number of rows to render the output for. This is required for some of the subprocesses to correctly render their output.' },
+		'terminal-rows': { type: 'number', implies: ['terminal-columns'], description: 'Number of columns to render the output for. This is required for some of the subprocesses to correctly render their output.' },
+	}).check(argv => {
+		const idLabels = (argv['id-label'] && (Array.isArray(argv['id-label']) ? argv['id-label'] : [argv['id-label']])) as string[] | undefined;
+		if (idLabels?.some(idLabel => !/.+=.+/.test(idLabel))) {
+			throw new Error('Invalid id label format. Expected format is name=value.');
+		}
+
+		return true;
+	});
+}
+
+export type StopArgs = UnpackArgv<ReturnType<typeof stopOptions>>;
+
+function stopHandler(args: StopArgs) {
+	(async () => stop(args))().catch(console.error);
+}
+
+async function stop(args: StopArgs) {
+	const result = await doStop(args);
+	const exitCode = result.outcome === 'error' ? 1 : 0;
+	console.log(JSON.stringify(result));
+	await result.dispose();
+	process.exit(exitCode);
+}
+
+async function doStop({
+	'docker-path': dockerPath,
+	'docker-compose-path': dockerComposePath,
+	'id-label': idLabel,
+	'workspace-folder': workspaceFolderArg,
+	'config': configParam,
+	'override-config': overrideConfig,
+	'log-level': logLevel,
+	'log-format': logFormat,
+	'terminal-columns': terminalColumns,
+	'terminal-rows': terminalRows,
+}: StopArgs) {
+	const disposables: (() => Promise<unknown> | undefined)[] = [];
+	const dispose = async () => {
+		await Promise.all(disposables.map(d => d()));
+	};
+
+	try {
+		const workspaceFolder = workspaceFolderArg ? path.resolve(process.cwd(), workspaceFolderArg) : undefined;
+		const providedIdLabels = idLabel ? Array.isArray(idLabel) ? idLabel as string[] : [idLabel] : undefined;
+		const configFile = configParam ? URI.file(path.resolve(process.cwd(), configParam)) : undefined;
+		const overrideConfigFile = overrideConfig ? URI.file(path.resolve(process.cwd(), overrideConfig)) : undefined;
+
+		const params = await createDockerParams({
+			dockerPath,
+			dockerComposePath,
+			containerSessionDataFolder: undefined,
+			containerDataFolder: undefined,
+			containerSystemDataFolder: undefined,
+			workspaceFolder,
+			mountWorkspaceGitRoot: false,
+			configFile,
+			overrideConfigFile,
+			logLevel: mapLogLevel(logLevel),
+			logFormat,
+			log: text => process.stderr.write(text),
+			terminalDimensions: terminalColumns && terminalRows ? { columns: terminalColumns, rows: terminalRows } : undefined,
+			defaultUserEnvProbe: 'none',
+			removeExistingContainer: false,
+			buildNoCache: false,
+			expectExistingContainer: false,
+			postCreateEnabled: false,
+			skipNonBlocking: false,
+			prebuild: false,
+			persistedFolder: undefined,
+			additionalMounts: [],
+			updateRemoteUserUIDDefault: 'never',
+			remoteEnv: {},
+			additionalCacheFroms: [],
+			useBuildKit: 'auto',
+			buildxPlatform: undefined,
+			buildxPush: false,
+			buildxOutput: undefined,
+			skipFeatureAutoMapping: false,
+			skipPostAttach: false,
+			skipPersistingCustomizationsFromFeatures: false,
+			dotfiles: {},
+		}, disposables);
+
+		const res = await stopDevcontainer(params, params.parsedAuthority, configFile, overrideConfigFile, providedIdLabels)
+
+		return {
+			outcome: 'success' as 'success',
+			...res,
+			dispose,
+		};
+	} catch (originalError) {
+		const originalStack = originalError?.stack;
+		const err = originalError instanceof ContainerError ? originalError : new ContainerError({
+			description: 'An error occurred stopping the container',
+			originalError,
+		});
+
+		if (originalStack) {
+			console.error(originalStack);
+		}
+		return {
+			outcome: 'error' as 'error',
+			message: err.message,
+			description: err.description,
+			dispose,
+		};
 	}
 }

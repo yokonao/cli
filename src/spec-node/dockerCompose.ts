@@ -725,3 +725,26 @@ function convertMountToVolumeTopLevelElement(mount: Mount): string {
 
 	return volume;
 }
+
+export async function stopDockerComposeDevContainers(params: DockerResolverParameters, cliParams: DockerCLIParameters, workspace: Workspace, config: DevContainerFromDockerComposeConfig) {
+	const { common } = params;
+	const { cliHost } = common;
+
+	const composeFiles = await getDockerComposeFilePaths(cliHost, config, cliHost.env, cliHost.cwd);
+	const projectName = await getProjectName(cliParams, workspace, composeFiles);
+	const infoOutput = makeLog(cliParams.output, LogLevel.Info);
+
+	const args = ['--project-name', projectName]
+	for (const composeFile of composeFiles) {
+		args.push('-f', composeFile);
+	}
+	args.push('stop')
+
+	if (params.isTTY) {
+		await dockerComposePtyCLI({ ...cliParams, output: infoOutput }, ...args);
+	} else {
+		await dockerComposeCLI({ ...cliParams, output: infoOutput }, ...args);
+	}
+
+	return { projectName, composeFiles }
+}
